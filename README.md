@@ -1,2 +1,2 @@
-# lexicore
+# Lexicore
 Legal Contract Risk Analyzer
