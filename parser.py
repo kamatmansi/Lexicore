@@ -24,6 +24,11 @@ def extract_text_from_pdf(pdf_path):
     for page_num in range(len(doc)):
         page = doc[page_num]
         page_text = page.get_text()
+        # Strip bare page numbers at the top or bottom of each page (P21).
+        # Only safe here, where page boundaries are still known.
+        page_text = re.sub(r'^\s*\d{1,3}\s*$', '', page_text,
+                           flags=re.MULTILINE, count=1)
+        page_text = re.sub(r'\n\s*\d{1,3}\s*\n?$', '\n', page_text)
         full_text += page_text + "\n"
 
     doc.close()

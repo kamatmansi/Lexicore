@@ -82,13 +82,16 @@ KEYWORD_RULES = [
     (r"\bwithout limitation\b.{0,60}\bliab", 2,
      "Liability language without a stated cap"),
 
-    (r"\bperpetual\b|\bin perpetuity\b|\birrevocabl", 2,
-     "Perpetual or irrevocable commitment"),
+    (r"\bperpetual\b|\bin perpetuity\b", 2,
+     "Perpetual commitment"),
+
+    (r"\birrevocabl\w*\b(?!.{0,40}\bsubmits?\b)", 2,
+     "Irrevocable commitment"),
 
     (r"\bwaive[sd]?\b.{0,40}\b(right|claim)", 2,
      "Waiver of rights"),
 
-    (r"\bexclusive\b.{0,40}\b(right|licen[cs]e|jurisdiction)", 2,
+    (r"(?<!non-)(?<!non )\bexclusive\b.{0,40}\b(right|licen[cs]e|jurisdiction)", 2,
      "Exclusivity commitment"),
 
     (r"\bshall not\b.{0,60}\b(compete|solicit|engage)", 2,
@@ -200,11 +203,16 @@ def summarize(scored):
     medium = sum(1 for c in scored if c["risk_level"] == "MEDIUM")
     low = sum(1 for c in scored if c["risk_level"] == "LOW")
 
-    # Overall = share of clauses carrying real risk, 0-100
-    weighted = (high * 3) + (medium * 1.5) + (low * 0.5)
-    overall = int(min(100, round(weighted / len(scored) * 100 / 3)))
+   # Sum actual severity rather than counting level buckets (P24).
+    # Level counting discards risk_score - a MEDIUM 4 counted the same
+    # as a MEDIUM 2 - so merging related clauses (P20) lowered the total
+    # even though the underlying risk was unchanged.
+    total_words = sum(len(c["clause_text"].split()) for c in scored)
+    total_risk = sum(c["risk_score"] for c in scored)
+    density = total_risk / max(total_words, 1) * 1000
+    overall = int(min(100, round(density * 3)))
 
-    if overall >= 50:
+    if overall >= 45:
         level = "HIGH"
     elif overall >= 25:
         level = "MEDIUM"
@@ -242,6 +250,7 @@ if __name__ == "__main__":
 
     test_files = [
         "data/sample_contract.pdf",
+        "data/COE-Sample.pdf",
         "data/sample-service-agreement.pdf"
     ]
 
