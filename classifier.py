@@ -2,193 +2,238 @@
 classifier.py
 Clause type classification for LexiCore.
 
-Baseline model: TF-IDF + Logistic Regression.
-Trains on data/cuad_cleaned.json, saves to models/.
-LEGAL-BERT can replace classify_clause() later without touching
-risk_scorer.py or dashboard.py.
+Primary model: LEGAL-BERT (nlpaueb/legal-bert-base-uncased) fine-tuned on
+CUAD paragraph-level data. Checkpoint lives in models/legalbert-cuad/.
+
+Fallback: TF-IDF + LogisticRegression baseline (models/baseline_clf.joblib),
+kept so the two can be benchmarked against each other and so the pipeline
+still runs if the transformer checkpoint is missing.
+
+Public interface is unchanged - risk_scorer.py and dashboard.py call:
+    classify_clause(text)     -> {clause_type, confidence}
+    classify_clauses(clauses) -> [{clause_text, clause_type, confidence}]
 """
 
-import json
 import os
-import joblib
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+import json
 
 # ── Config ──────────────────────────────────────────────────
-DATA_PATH = "data/cuad_cleaned.json"
-MODEL_DIR = "models"
-MODEL_PATH = os.path.join(MODEL_DIR, "baseline_clf.joblib")
+BERT_DIR = os.path.join("models", "legalbert-cuad")
+BASELINE_PATH = os.path.join("models", "baseline_clf.joblib")
 
-MIN_SAMPLES_PER_CLASS = 20   # drop clause types too rare to learn
-MIN_CONFIDENCE = 0.25        # below this -> "General / Unclassified"
+# 37 classes: random guessing is ~0.027, so a prediction at 0.30 is the
+# model being fairly confident. Calibrate against 1/n_classes, not intuition.
+MIN_CONFIDENCE = 0.30
 UNKNOWN_LABEL = "General / Unclassified"
 
-_MODEL = None  # lazy-loaded cache
+BATCH_SIZE = 16
+MAX_LENGTH = 256          # matches the fine-tuning setting
+
+_BERT = None              # lazy-loaded (tokenizer, model, device)
+_BASELINE = None
 
 
-# ── Data loading ────────────────────────────────────────────
-def load_training_data(path=DATA_PATH):
+# ── LEGAL-BERT ──────────────────────────────────────────────
+def load_bert():
     """
-    Returns (texts, labels) from cuad_cleaned.json.
-    Drops empty text and very rare clause types.
+    Loads the fine-tuned checkpoint once and caches it.
+    First call takes ~15-20s on CPU while 110M parameters initialise.
     """
-    with open(path, encoding="utf-8") as f:
-        records = json.load(f)
+    global _BERT
+    if _BERT is not None:
+        return _BERT
 
-    # Count how many samples each clause type has
-    counts = {}
-    for r in records:
-        counts[r["clause_type"]] = counts.get(r["clause_type"], 0) + 1
+    if not os.path.isdir(BERT_DIR):
+        raise FileNotFoundError(
+            f"No LEGAL-BERT checkpoint at {BERT_DIR}. "
+            "Extract legalbert-cuad.zip there, or use backend='baseline'."
+        )
 
-    texts, labels = [], []
-    for r in records:
-        text = (r.get("clause_text") or "").strip()
-        label = r["clause_type"]
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-        if len(text.split()) < 3:
-            continue
-        if counts[label] < MIN_SAMPLES_PER_CLASS:
-            continue
+    tokenizer = AutoTokenizer.from_pretrained(BERT_DIR)
+    model = AutoModelForSequenceClassification.from_pretrained(BERT_DIR)
+    model.eval()                      # inference mode: no dropout, no grad
 
-        texts.append(text)
-        labels.append(label)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
 
-    kept = sorted(set(labels))
-    print(f"Loaded {len(records)} records -> {len(texts)} usable")
-    print(f"Clause types kept: {len(kept)} (dropped types with "
-          f"<{MIN_SAMPLES_PER_CLASS} samples)")
-
-    return texts, labels
+    _BERT = (tokenizer, model, device)
+    return _BERT
 
 
-# ── Training ────────────────────────────────────────────────
-def train(save=True):
+def _classify_bert(texts):
     """
-    Trains the baseline classifier and prints a report.
-    Returns the fitted (vectorizer, model, labels) bundle.
+    Batched inference. Returns list of (label, confidence).
     """
-    texts, labels = load_training_data()
+    import torch
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        texts, labels,
-        test_size=0.2,
-        random_state=42,
-        stratify=labels
-    )
+    tokenizer, model, device = load_bert()
+    out = []
 
-    print(f"\nTrain: {len(X_train)}   Test: {len(X_test)}")
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i:i + BATCH_SIZE]
 
-    vectorizer = TfidfVectorizer(
-        ngram_range=(1, 2),
-        min_df=2,
-        max_features=50000,
-        sublinear_tf=True,
-        strip_accents="unicode",
-        lowercase=True
-    )
+        enc = tokenizer(batch, truncation=True, max_length=MAX_LENGTH,
+                        padding=True, return_tensors="pt").to(device)
 
-    print("Vectorizing...")
-    X_train_vec = vectorizer.fit_transform(X_train)
-    X_test_vec = vectorizer.transform(X_test)
-    print(f"Feature count: {X_train_vec.shape[1]}")
+        with torch.no_grad():         # no gradients needed for inference
+            logits = model(**enc).logits
+            probs = torch.softmax(logits, dim=-1)
 
-    print("Training logistic regression...")
-    model = LogisticRegression(
-        max_iter=2000,
-        class_weight="balanced",   # CUAD is heavily imbalanced
-        C=5.0,
-        n_jobs=-1
-    )
-    model.fit(X_train_vec, y_train)
+        conf, idx = probs.max(dim=-1)
 
-    # ── Evaluate ────────────────────────────────────────────
-    y_pred = model.predict(X_test_vec)
-    print("\n" + "=" * 60)
-    print("CLASSIFICATION REPORT")
-    print("=" * 60)
-    print(classification_report(y_test, y_pred, zero_division=0))
+        for c, j in zip(conf.tolist(), idx.tolist()):
+            out.append((model.config.id2label[j], float(c)))
 
-    accuracy = (y_pred == y_test).mean() if hasattr(y_pred, "mean") else \
-        sum(p == t for p, t in zip(y_pred, y_test)) / len(y_test)
-    print(f"Overall accuracy: {accuracy:.3f}")
-
-    bundle = {
-        "vectorizer": vectorizer,
-        "model": model,
-        "labels": sorted(set(labels))
-    }
-
-    if save:
-        os.makedirs(MODEL_DIR, exist_ok=True)
-        joblib.dump(bundle, MODEL_PATH)
-        print(f"\nSaved model -> {MODEL_PATH}")
-
-    return bundle
+    return out
 
 
-# ── Inference ───────────────────────────────────────────────
-def load_model():
-    """Loads the saved model once and caches it."""
-    global _MODEL
-    if _MODEL is None:
-        if not os.path.exists(MODEL_PATH):
+# ── TF-IDF baseline (kept for comparison) ───────────────────
+def load_baseline():
+    global _BASELINE
+    if _BASELINE is None:
+        import joblib
+        if not os.path.exists(BASELINE_PATH):
             raise FileNotFoundError(
-                f"No model at {MODEL_PATH}. Run: python classifier.py train"
+                f"No baseline model at {BASELINE_PATH}. "
+                "Run: python classifier.py train"
             )
-        _MODEL = joblib.load(MODEL_PATH)
-    return _MODEL
+        _BASELINE = joblib.load(BASELINE_PATH)
+    return _BASELINE
 
 
-def classify_clause(text):
-    """
-    Takes one clause string.
-    Returns dict: {clause_type, confidence}
-    """
-    bundle = load_model()
-    vec = bundle["vectorizer"].transform([text])
-    probs = bundle["model"].predict_proba(vec)[0]
+def _classify_baseline(texts):
+    bundle = load_baseline()
+    vecs = bundle["vectorizer"].transform(texts)
+    probs = bundle["model"].predict_proba(vecs)
 
-    best_idx = probs.argmax()
-    label = bundle["model"].classes_[best_idx]
-    confidence = float(probs[best_idx])
-
-    if confidence < MIN_CONFIDENCE:
-        label = UNKNOWN_LABEL
-
-    return {"clause_type": label, "confidence": round(confidence, 3)}
+    out = []
+    for row in probs:
+        j = row.argmax()
+        out.append((bundle["model"].classes_[j], float(row[j])))
+    return out
 
 
-def classify_clauses(clauses):
+# ── Public interface ────────────────────────────────────────
+def classify_clauses(clauses, backend="bert"):
     """
     Takes list of clause strings (output of segmenter.split_into_clauses).
-    Returns list of dicts: {clause_text, clause_type, confidence}
-    This is the format risk_scorer.py will consume.
+    Returns list of {clause_text, clause_type, confidence}.
+
+    backend: 'bert' (default) or 'baseline'
     """
+    if not clauses:
+        return []
+
+    if backend == "bert":
+        preds = _classify_bert(clauses)
+    elif backend == "baseline":
+        preds = _classify_baseline(clauses)
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
+
     results = []
-    for clause in clauses:
-        pred = classify_clause(clause)
+    for text, (label, conf) in zip(clauses, preds):
+        if conf < MIN_CONFIDENCE:
+            label = UNKNOWN_LABEL
         results.append({
-            "clause_text": clause,
-            "clause_type": pred["clause_type"],
-            "confidence": pred["confidence"]
+            "clause_text": text,
+            "clause_type": label,
+            "confidence": round(conf, 3),
         })
     return results
 
 
-# ── TEST / CLI ──────────────────────────────────────────────
+def classify_clause(text, backend="bert"):
+    """
+    Single clause. Returns {clause_type, confidence}.
+    Prefer classify_clauses() for multiple - batching is much faster.
+    """
+    r = classify_clauses([text], backend=backend)[0]
+    return {"clause_type": r["clause_type"], "confidence": r["confidence"]}
+
+
+# ── Baseline training (unchanged, for reproducing the comparison) ──
+def train_baseline():
+    """
+    Trains the TF-IDF baseline on the paragraph-level dataset, using the
+    same contract-level split as LEGAL-BERT so the two are comparable.
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import accuracy_score, f1_score
+    import joblib
+
+    path = os.path.join("data", "cuad_paragraph.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found. Generate it with the Colab extraction cell."
+        )
+
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+
+    X_train = [r["clause_text"] for r in d["train"]]
+    y_train = [r["clause_type"] for r in d["train"]]
+    X_test = [r["clause_text"] for r in d["test"]]
+    y_test = [r["clause_type"] for r in d["test"]]
+
+    print(f"Train: {len(X_train)}   Test: {len(X_test)}")
+
+    vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=2,
+                                 max_features=50000, sublinear_tf=True,
+                                 strip_accents="unicode")
+    Xtr = vectorizer.fit_transform(X_train)
+    Xte = vectorizer.transform(X_test)
+
+    model = LogisticRegression(max_iter=2000, class_weight="balanced",
+                               C=5.0, n_jobs=-1)
+    model.fit(Xtr, y_train)
+
+    pred = model.predict(Xte)
+    print(f"accuracy    : {accuracy_score(y_test, pred):.4f}")
+    print(f"f1_macro    : {f1_score(y_test, pred, average='macro', zero_division=0):.4f}")
+    print(f"f1_weighted : {f1_score(y_test, pred, average='weighted', zero_division=0):.4f}")
+
+    os.makedirs("models", exist_ok=True)
+    joblib.dump({"vectorizer": vectorizer, "model": model,
+                 "labels": sorted(set(y_train))}, BASELINE_PATH)
+    print(f"Saved -> {BASELINE_PATH}")
+
+
+# ── CLI ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "train":
-        train()
-    else:
-        # Run the full pipeline on a sample PDF
+        train_baseline()
+
+    elif len(sys.argv) > 1 and sys.argv[1] == "compare":
+        # Side-by-side on a real contract
         from segmenter import segment_pdf
 
-        pdf = "data/sample_contract.pdf"
+        pdf = sys.argv[2] if len(sys.argv) > 2 else "data/COE-Sample.pdf"
+        clauses = segment_pdf(pdf)
+
+        bert = classify_clauses(clauses, backend="bert")
+        base = classify_clauses(clauses, backend="baseline")
+
+        print("\n" + "=" * 78)
+        print(f"{'BERT':<34} | {'BASELINE':<34}")
+        print("=" * 78)
+        for b, s, text in zip(bert, base, clauses):
+            mark = " " if b["clause_type"] == s["clause_type"] else "*"
+            print(f"{mark}{b['clause_type'][:26]:<27}{b['confidence']:.2f} "
+                  f"| {s['clause_type'][:26]:<27}{s['confidence']:.2f}")
+            print(f"   {text[:70]}...")
+        print("\n* = models disagree")
+
+    else:
+        from segmenter import segment_pdf
+
+        pdf = sys.argv[1] if len(sys.argv) > 1 else "data/sample_contract.pdf"
         clauses = segment_pdf(pdf)
         results = classify_clauses(clauses)
 

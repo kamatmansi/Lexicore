@@ -3,3 +3,4 @@ venv/
 __pycache__/
 *.pyc
 models/
+data/cuad_paragraph.json
