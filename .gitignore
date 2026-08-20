@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 models/
 data/cuad_paragraph.json
+lexicore.db

@@ -4,20 +4,22 @@ Streamlit UI for LexiCore.
 
 Run with:  streamlit run dashboard.py
 
-Layout follows the order a user actually needs:
-  Overview -> Summary -> Charts -> All clauses -> Export
+Layout:
+  Sidebar  -> saved contract history (FR9)
+  Main     -> Overview -> Summary -> Charts -> All clauses -> Export
 
-Fixes in this version:
-  FR6  - summary section wired in (summarizer.py)
+Fixes / features in this version:
+  FR6  - TextRank summary section (summarizer.py)
+  FR9  - analyses persisted to SQLite and reloadable (database.py)
   P18  - chart categories no longer reordered alphabetically by Streamlit
   P40  - CUAD acronyms rendered correctly in the UI ("Ip" -> "IP")
-  NFR5 - uploaded files are now deleted after analysis rather than
-         accumulating in the system temp directory
-  NFR2 - analysis time measured and displayed
+  NFR2 - analysis time measured, excluding one-time model load
+  NFR5 - uploaded files deleted after analysis
 """
 
 import os
 import json
+import hashlib
 import shutil
 import tempfile
 import time
@@ -26,12 +28,14 @@ import pandas as pd
 import streamlit as st
 
 from segmenter import segment_pdf
-from classifier import classify_clauses
+from classifier import classify_clauses, load_bert
 from risk_scorer import score_clauses, summarize as risk_summarize
 from summarizer import summarize as build_summary, format_text
+import database as db
 
 # ── Page setup ──────────────────────────────────────────────
-st.set_page_config(page_title="LexiCore", page_icon="§", layout="wide")
+st.set_page_config(page_title="LexiCore", page_icon="§", layout="wide",
+                   initial_sidebar_state="expanded")
 
 LEVEL_COLOR = {
     "HIGH":   "#c0392b",
@@ -54,9 +58,8 @@ LEVEL_ORDER = {
 def pretty_type(t):
     """
     P40: CUAD labels are title-cased, so acronyms render as
-    'Ip Ownership Assignment' and 'Rofr/Rofo/Rofn'. Restore them for
-    display only - the underlying labels are left untouched so
-    CLAUSE_RISK lookups and CSV exports still match.
+    'Ip Ownership Assignment'. Restore them for display only - the
+    underlying labels are untouched so CLAUSE_RISK lookups still match.
     """
     for a, b in [("Ip ", "IP "), ("Rofr", "ROFR"), ("Rofo", "ROFO"),
                  ("Rofn", "ROFN"), ("Gst", "GST")]:
@@ -70,9 +73,8 @@ def analyze(pdf_bytes, filename):
     Runs the full pipeline. Cached on file contents so re-filtering the
     view does not re-run analysis.
 
-    NFR5: the uploaded file is written to a temporary directory, read, and
-    the directory removed in a finally block. Previously these accumulated
-    for the life of the machine.
+    NFR5: the uploaded file is written to a temporary directory and the
+    directory removed in a finally block, rather than accumulating.
     """
     tmp_dir = tempfile.mkdtemp(prefix="lexicore_")
     tmp_path = os.path.join(tmp_dir, filename)
@@ -90,12 +92,55 @@ def analyze(pdf_bytes, filename):
         summary = build_summary(scored, stats)
 
         elapsed = time.perf_counter() - started
-
         return scored, stats, summary, elapsed
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+
+# ── Sidebar: saved contracts (FR9) ──────────────────────────
+db.init_db()
+
+with st.sidebar:
+    st.header("Saved analyses")
+
+    totals = db.stats_overview()
+    st.caption(f"{totals['contracts']} contracts · "
+               f"{totals['clauses']} clauses stored")
+
+    saved = db.list_contracts(limit=25)
+
+    if not saved:
+        st.info("Nothing saved yet. Analyse a contract and it will appear "
+                "here.")
+    else:
+        for row in saved:
+            color = LEVEL_COLOR.get(row["overall_level"], "#95a5a6")
+            label = (f"{row['filename'][:28]}  ·  "
+                     f"{row['overall_score']}/100")
+
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                if st.button(label, key=f"open_{row['contract_id']}",
+                             width='stretch'):
+                    st.session_state.load_id = row["contract_id"]
+                    st.rerun()
+            with c2:
+                if st.button("×", key=f"del_{row['contract_id']}",
+                             help="Delete"):
+                    db.delete_contract(row["contract_id"])
+                    if st.session_state.get("load_id") == row["contract_id"]:
+                        st.session_state.pop("load_id", None)
+                    st.rerun()
+
+            st.markdown(
+                f"<div style='border-left:3px solid {color};"
+                f"padding-left:8px;margin:-8px 0 10px 0'>"
+                f"<small>{row['upload_date'][:16].replace('T', ' ')} · "
+                f"{row['total_clauses']} clauses · "
+                f"{row['overall_level']}</small></div>",
+                unsafe_allow_html=True
+            )
 
 # ── Header ──────────────────────────────────────────────────
 st.title("LexiCore")
@@ -107,7 +152,7 @@ with st.expander("How this works, and what it cannot do"):
 **Pipeline:** PDF text extraction (PyMuPDF) → rule-based clause segmentation →
 clause classification (LEGAL-BERT fine-tuned on CUAD, 0.752 accuracy on a
 contract-level split) → hybrid risk scoring (clause-type weights + keyword
-rules) → TextRank summarisation.
+rules) → TextRank summarisation → SQLite persistence.
 
 **Known limitations:**
 - The classifier is trained on CUAD, which covers commercial, distribution and
@@ -126,37 +171,79 @@ rules) → TextRank summarisation.
 advice.**
     """)
 
-# ── Upload ──────────────────────────────────────────────────
-uploaded = st.file_uploader("Upload a contract (PDF)", type=["pdf"])
+# ── Load saved analysis, or analyse an upload ───────────────
+scored = stats = summary = None
+elapsed = None
+source_name = None
+loaded_from_db = False
 
-if uploaded is None:
-    st.info("Upload a PDF to begin. Sample contracts are in the `data/` folder.")
-    st.stop()
+if st.session_state.get("load_id"):
+    record = db.load_analysis(st.session_state.load_id)
+    if record is None:
+        st.session_state.pop("load_id", None)
+        st.warning("That analysis no longer exists.")
+    else:
+        scored = record["scored"]
+        stats = record["stats"]
+        summary = record["summary"]
+        elapsed = record["analysis_time"]
+        source_name = record["filename"]
+        loaded_from_db = True
 
-# Load the model before timing, so the ~18s one-off initialisation of
-# LEGAL-BERT's 110M parameters is not counted against per-contract
-# analysis time (NFR2). In a deployed service the model is loaded once
-# at startup, not per request.
-from classifier import load_bert
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            st.success(f"Loaded **{source_name}** "
+                       f"(saved {record['upload_date'][:16].replace('T', ' ')})")
+        with c2:
+            if st.button("New analysis", width='stretch'):
+                st.session_state.pop("load_id", None)
+                st.rerun()
 
-if "model_loaded" not in st.session_state:
-    with st.spinner("Loading LEGAL-BERT (one-time, ~20s)..."):
-        load_bert()
-    st.session_state.model_loaded = True
+if not loaded_from_db:
+    uploaded = st.file_uploader("Upload a contract (PDF)", type=["pdf"])
 
-with st.spinner("Analysing contract..."):
-    try:
-        scored, stats, summary, elapsed = analyze(uploaded.getvalue(),
-                                                  uploaded.name)
-    except FileNotFoundError as e:
-        st.error(f"Model not found. Extract the LEGAL-BERT checkpoint into "
-                 f"`models/legalbert-cuad/` first.\n\n{e}")
+    if uploaded is None:
+        st.info("Upload a PDF to begin, or open a saved analysis from the "
+                "sidebar. Sample contracts are in the `data/` folder.")
         st.stop()
 
-if not scored:
-    st.warning("No clauses could be extracted. This PDF may be a scanned "
-               "image with no text layer.")
-    st.stop()
+    # NFR2: load the model before timing, so the one-time ~18s
+    # initialisation of 110M parameters is not charged to per-contract
+    # analysis time. A deployed service loads once at startup.
+    if "model_loaded" not in st.session_state:
+        with st.spinner("Loading LEGAL-BERT (one-time, ~20s)..."):
+            load_bert()
+        st.session_state.model_loaded = True
+
+    with st.spinner("Analysing contract..."):
+        try:
+            scored, stats, summary, elapsed = analyze(uploaded.getvalue(),
+                                                      uploaded.name)
+        except FileNotFoundError as e:
+            st.error(f"Model not found. Extract the LEGAL-BERT checkpoint "
+                     f"into `models/legalbert-cuad/` first.\n\n{e}")
+            st.stop()
+
+    if not scored:
+        st.warning("No clauses could be extracted. This PDF may be a scanned "
+                   "image with no text layer.")
+        st.stop()
+
+    source_name = uploaded.name
+
+    # FR9: persist the analysis.
+    #
+    # P41: the duplicate check queries the DATABASE by content hash, not
+    # Streamlit session state. Session state is forgotten on restart and is
+    # not cleared when a contract is deleted - so re-uploading a deleted
+    # file was silently skipped and never reappeared in the sidebar.
+    content_hash = hashlib.sha256(uploaded.getvalue()).hexdigest()
+
+    if db.find_by_hash(content_hash) is None:
+        cid = db.save_analysis(uploaded.name, scored, stats, summary,
+                               analysis_time=elapsed,
+                               content_hash=content_hash)
+        st.toast(f"Saved to database (id {cid})")
 
 # ── Overview ────────────────────────────────────────────────
 st.subheader("Contract overview")
@@ -170,41 +257,47 @@ c5.metric("Overall", f"{stats['overall_score']}/100",
           stats["overall_level"])
 
 st.progress(stats["overall_score"] / 100)
-st.caption(f"Analysed in {elapsed:.1f}s  ·  "
-           f"{stats['total_clauses']} clauses")
+
+if elapsed:
+    st.caption(f"Analysed in {elapsed:.1f}s · "
+               f"{stats['total_clauses']} clauses"
+               + ("  ·  loaded from database" if loaded_from_db else ""))
 
 # ── Summary ─────────────────────────────────────────────────
-st.subheader("Summary")
+if summary:
+    st.subheader("Summary")
 
-for line in summary["overview"]:
-    st.write(line)
+    for line in summary["overview"]:
+        st.write(line)
 
-if summary["provisions"]:
-    st.markdown("**Key provisions** — ranked by importance to the contract "
-                "and level of risk")
+    if summary["provisions"]:
+        st.markdown("**Key provisions** — ranked by importance to the "
+                    "contract and level of risk")
 
-    for i, p in enumerate(summary["provisions"], 1):
-        color = LEVEL_COLOR[p["risk_level"]]
-        st.markdown(
-            f"<div style='border-left:4px solid {color};"
-            f"padding:6px 0 6px 12px;margin:10px 0'>"
-            f"<b>{i}. {pretty_type(p['clause_type'])}</b> &nbsp;·&nbsp; "
-            f"<span style='color:{color}'>{p['risk_level']}</span> "
-            f"(risk {p['risk_score']}/10)<br>"
-            f"<i>\"{p['quote']}\"</i>"
-            + (f"<br><small>Flagged for: {'; '.join(p['reasons'])}</small>"
-               if p["reasons"] else "")
-            + "</div>",
-            unsafe_allow_html=True
+        for i, p in enumerate(summary["provisions"], 1):
+            color = LEVEL_COLOR[p["risk_level"]]
+            st.markdown(
+                f"<div style='border-left:4px solid {color};"
+                f"padding:6px 0 6px 12px;margin:10px 0'>"
+                f"<b>{i}. {pretty_type(p['clause_type'])}</b> "
+                f"&nbsp;·&nbsp; "
+                f"<span style='color:{color}'>{p['risk_level']}</span> "
+                f"(risk {p['risk_score']}/10)<br>"
+                f"<i>\"{p['quote']}\"</i>"
+                + (f"<br><small>Flagged for: "
+                   f"{'; '.join(p['reasons'])}</small>"
+                   if p.get("reasons") else "")
+                + "</div>",
+                unsafe_allow_html=True
+            )
+
+    if summary["risk_areas"]:
+        st.markdown("**Main risk areas**")
+        area_df = pd.DataFrame(
+            [(a[0], a[1]) for a in summary["risk_areas"]],
+            columns=["Risk area", "Clauses"]
         )
-
-if summary["risk_areas"]:
-    st.markdown("**Main risk areas**")
-    area_df = pd.DataFrame(
-        [(a, n) for a, n, _ in summary["risk_areas"]],
-        columns=["Risk area", "Clauses"]
-    )
-    st.dataframe(area_df, hide_index=True, use_container_width=True)
+        st.dataframe(area_df, hide_index=True, width='stretch')
 
 # ── Charts ──────────────────────────────────────────────────
 st.subheader("Distribution")
@@ -225,8 +318,7 @@ with right:
     st.markdown("**Clause types detected**")
     types = df[df["clause_type"] != "General / Unclassified"]["clause_type"]
     if len(types):
-        named = types.map(pretty_type).value_counts().head(10)
-        st.bar_chart(named)
+        st.bar_chart(types.map(pretty_type).value_counts().head(10))
     else:
         st.caption("No clauses were confidently classified.")
 
@@ -262,14 +354,14 @@ for c in visible:
 
 # ── Export ──────────────────────────────────────────────────
 st.subheader("Export")
-stem = uploaded.name.rsplit(".", 1)[0]
+stem = (source_name or "contract").rsplit(".", 1)[0]
 
 e1, e2, e3 = st.columns(3)
 
 with e1:
     st.download_button(
         "Summary (text)",
-        data=format_text(summary),
+        data=format_text(summary) if summary else "No summary available.",
         file_name=f"{stem}_summary.txt",
         mime="text/plain"
     )
@@ -278,7 +370,7 @@ with e2:
     st.download_button(
         "Full analysis (JSON)",
         data=json.dumps({"stats": stats, "summary": summary,
-                         "clauses": scored}, indent=2),
+                         "clauses": scored}, indent=2, default=str),
         file_name=f"{stem}_analysis.json",
         mime="application/json"
     )
